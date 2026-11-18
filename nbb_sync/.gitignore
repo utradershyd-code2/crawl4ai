@@ -1,0 +1,5 @@
+profile/
+output/
+.env
+sync_log.txt
+__pycache__/
