@@ -19,25 +19,26 @@ exit /b
 rem Remove an install made with a different Python version, such as the failed 3.15 one.
 if exist .venv\Scripts\python.exe .venv\Scripts\python.exe -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)" || rmdir /s /q .venv
 if not exist .venv\Scripts\python.exe py -3.12 -m venv .venv
-call .venv\Scripts\activate
+rem Use the folder's own Python directly, so the folder keeps working if it is moved.
+set "PY=%~dp0.venv\Scripts\python.exe"
 echo Installing crawl4ai, a few minutes the first time...
-python -m pip install -q --upgrade pip
-pip install -q --only-binary=fastuuid,PyYAML crawl4ai || goto :installfailed
+"%PY%" -m pip install -q --upgrade pip
+"%PY%" -m pip install -q --only-binary=fastuuid,PyYAML crawl4ai || goto :installfailed
 echo Installing the browser crawl4ai uses...
-crawl4ai-setup
+"%PY%" -c "from crawl4ai.install import post_install; post_install()"
 if not exist .env copy .env.example .env >nul
 echo.
 echo Notepad will open .env: paste your CRON_KEY after "CRON_KEY=", save with Ctrl+S and close Notepad.
 notepad .env
 echo.
 echo Now log in to the panel once. A browser window opens: enter your password and security answer.
-python nbb_sync.py login
+"%PY%" nbb_sync.py login
 echo.
 echo First sync:
-python nbb_sync.py sync
+"%PY%" nbb_sync.py sync
 echo.
-echo Scheduling an automatic sync every hour while this PC is on...
-schtasks /Create /SC HOURLY /TN "NBB Panel Sync" /TR "\"%~dp0run_sync.bat\"" /F >nul && echo Done: Task Scheduler runs it every hour.
+echo Scheduling an automatic sync every 15 minutes while this PC is on...
+schtasks /Create /SC MINUTE /MO 15 /TN "NBB Panel Sync" /TR "\"%~dp0run_sync.bat\"" /F >nul && echo Done: Task Scheduler runs it every 15 minutes, which also keeps the panel login alive.
 echo.
 echo Setup finished. If you ever see "Panel session expired", double-click login.bat.
 pause

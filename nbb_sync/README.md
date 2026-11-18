@@ -20,7 +20,7 @@ It does **not** copy passwords, CNIC numbers or MAC addresses.
 1. Extract the zip (right-click > Extract All).
 2. Double-click **setup.bat**. It installs everything, opens `.env` in Notepad
    (paste your `CRON_KEY`, save, close), opens the panel for you to log in once,
-   runs the first sync and schedules one every hour.
+   runs the first sync and schedules one every 15 minutes.
 
 ## Every sync
 ```
@@ -34,8 +34,8 @@ It prints what ISP Desk did, e.g. `ISP Desk: 157 rows, 0 new, 3 changed`.
 * **"Upload refused: HTTP 403"**: `CRON_KEY` in `.env` doesn't match the server.
 
 ## Run it automatically
-`setup.bat` creates the Task Scheduler task **"NBB Panel Sync"** (every hour while
-the PC is on). Results are written to `sync_log.txt`. Session expired? Double-click `login.bat`.
+`setup.bat` creates the Task Scheduler task **"NBB Panel Sync"** (every 15 minutes while
+the PC is on, which also keeps the panel login alive). Results are written to `sync_log.txt`. Session expired? Double-click `login.bat`.
 
 ## Privacy
 `profile/` (your logged-in session), `output/` (customer data) and `.env` are in
