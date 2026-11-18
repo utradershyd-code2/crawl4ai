@@ -7,8 +7,12 @@ Reads your customer list from `partner.nationalbroadband.pk` **on your own PC**
 updates packages, expiry dates and status.
 
 ## What it copies
-Status, name, customer ID, package, bandwidth, address, mobile, activation date,
-expiration date, remaining days, block reason, comments.
+* **Customer list:** status, name, customer ID, package, bandwidth, address, mobile,
+  activation and expiration dates, remaining days, block reason, comments.
+* **Real Time Billing Report** (all pages): ISP Desk creates a recharge invoice for each
+  (at the customer's own sale price, else the package list price; never the panel amount)
+  and deducts the real cost (panel amount x 2) from the panel wallet.
+* **Panel balance** ("Available Balance"): ISP Desk stores it x 2 as the real balance.
 
 It does **not** copy passwords, CNIC numbers or MAC addresses.
 

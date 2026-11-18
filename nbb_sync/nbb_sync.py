@@ -16,6 +16,7 @@ the session; when that happens, `sync` tells you to run `login` again.
 import asyncio
 import csv
 import json
+import re
 import os
 import sys
 import urllib.error
@@ -54,6 +55,15 @@ COLUMNS = [
     "Comments",
 ]
 DEFAULT_SYNC_URL = "https://net.universalfarmaco.com.pk/cron/panel-push"
+
+# Real Time Billing Report: one row per recharge. ISP Desk turns these into
+# recharge invoices and deducts each recharge's real cost from the panel wallet.
+# The panel shows 10 rows per page, so pages are read one by one.
+REPORT_URL = (PANEL + "/report/view?ispRates=0&dateRange=&report_type=5&partner_id=20575"
+              "&subdealerRates=0&allowsubdealer=0&billing_cycle=&billing_mode=1"
+              "&merged_checkbox_checked=false&subdealer_rates_checkbox_checked=false"
+              "&package_id=&pkg_id=&per-page=10&page={page}")
+MAX_REPORT_PAGES = 50
 
 
 def load_env(path: Path = HERE / ".env") -> None:
@@ -94,6 +104,37 @@ def parse_customers(html: str) -> list[dict]:
     return customers
 
 
+def parse_balance(html: str) -> str:
+    """'Available Balance = 869.45' shown at the top of every panel page (ISP Desk doubles it)."""
+    soup = BeautifulSoup(html, "lxml")
+    label = soup.find("label", attrs={"for": "available_credit_limit"})
+    value = label.find("b").get_text(strip=True) if label and label.find("b") else ""
+    return value.replace(",", "")
+
+
+def parse_report(html: str) -> tuple[list[dict], int]:
+    """Rows of the Real Time Billing Report page, plus the report's total item count (0 if unknown)."""
+    soup = BeautifulSoup(html, "lxml")
+    total = 0
+    summary = soup.select_one(".summary")
+    if summary:
+        nums = [int(n) for n in re.findall(r"\d+", summary.get_text().replace(",", ""))]
+        total = nums[-1] if nums else 0
+    for t in soup.find_all("table"):
+        heads = [th.get_text(" ", strip=True) for th in t.select("thead th")]
+        if "Customer ID" in heads and "Last Activation Date" in heads:
+            rows = []
+            for tr in t.select("tbody tr"):
+                cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+                if len(cells) < len(heads):
+                    continue
+                row = {h: v for h, v in zip(heads, cells) if h and h != "#"}
+                if row.get("Customer ID"):
+                    rows.append(row)
+            return rows, total
+    return [], total
+
+
 def browser(headless: bool) -> AsyncWebCrawler:
     PROFILE_DIR.mkdir(exist_ok=True)
     return AsyncWebCrawler(
@@ -125,7 +166,7 @@ async def login() -> None:
         sys.exit(1)
 
 
-def upload(customers: list[dict]) -> None:
+def upload(customers: list[dict], recharges: list[dict] | None = None, balance: str = "") -> None:
     """Send the rows to ISP Desk's /cron/panel-push (same key as CRON_KEY on the server)."""
     key = os.environ.get("CRON_KEY", "").strip()
     if not key:
@@ -133,7 +174,12 @@ def upload(customers: list[dict]) -> None:
         return
     url = os.environ.get("SYNC_URL", "").strip() or DEFAULT_SYNC_URL
     stamp = datetime.now().strftime("%d-%m-%Y %H:%M")
-    body = json.dumps({"rows": customers, "notes": [f"crawl4ai helper, {stamp}"]}).encode("utf-8")
+    payload = {"rows": customers, "notes": [f"crawl4ai helper, {stamp}"]}
+    if recharges:
+        payload["recharges"] = recharges
+    if balance:
+        payload["balance"] = balance
+    body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
@@ -152,11 +198,19 @@ def upload(customers: list[dict]) -> None:
         print("ISP Desk reported an error:", res["error"])
         sys.exit(3)
     print(f"ISP Desk: {res.get('rows', 0)} rows, {res.get('new', 0)} new, "
-          f"{res.get('changed', 0)} changed, {res.get('not_in_panel', 0)} not in panel.")
+          f"{res.get('changed', 0)} changed, {res.get('not_in_panel', 0)} not in panel, "
+          f"{res.get('payments_new', 0)} recharge invoices created.")
+    for note in res.get("notes") or []:
+        print("  -", note)
 
 
-def save(customers: list[dict]) -> None:
+def save(customers: list[dict], recharges: list[dict] | None = None) -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
+    if recharges:
+        with open(OUTPUT_DIR / "recharges.csv", "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=list(recharges[0].keys()), extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(recharges)
     (OUTPUT_DIR / "customers.json").write_text(
         json.dumps(customers, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -168,26 +222,39 @@ def save(customers: list[dict]) -> None:
 
 
 async def sync() -> None:
+    run = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, page_timeout=60_000)
     async with browser(headless=True) as crawler:
-        result = await crawler.arun(
-            CUSTOMERS_URL,
-            config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS, page_timeout=60_000),
-        )
-    final_url = result.redirected_url or result.url or ""
-    if LOGIN_PATH in final_url:
-        print("Panel session expired. Run:  python nbb_sync.py login")
-        sys.exit(2)
-    if not result.success:
-        print("Could not load the panel:", result.error_message)
-        sys.exit(1)
+        result = await crawler.arun(CUSTOMERS_URL, config=run)
+        final_url = result.redirected_url or result.url or ""
+        if LOGIN_PATH in final_url:
+            print("Panel session expired. Run:  python nbb_sync.py login")
+            sys.exit(2)
+        if not result.success:
+            print("Could not load the panel:", result.error_message)
+            sys.exit(1)
+        customers = parse_customers(result.html)
+        balance = parse_balance(result.html)
 
-    customers = parse_customers(result.html)
+        recharges, seen = [], set()
+        for page in range(1, MAX_REPORT_PAGES + 1):
+            rep = await crawler.arun(REPORT_URL.format(page=page), config=run)
+            if not rep.success:
+                print(f"Recharge report page {page} could not be read:", rep.error_message)
+                break
+            rows, total = parse_report(rep.html)
+            new = [r for r in rows if tuple(r.items()) not in seen]
+            seen.update(tuple(r.items()) for r in new)
+            recharges.extend(new)
+            if not new or len(rows) < 10 or (total and len(recharges) >= total):
+                break
+
     expiring = [c for c in customers if c.get("Status") == "Active"
                 and c.get("Remaining Days", "").lstrip("-").isdigit()
                 and int(c["Remaining Days"]) <= 5]
     print(f"{len(customers)} customers read, {len(expiring)} active ones expire within 5 days.")
-    save(customers)
-    upload(customers)
+    print(f"{len(recharges)} recharges in the Real Time Billing Report. Panel balance: {balance or 'not found'}.")
+    save(customers, recharges)
+    upload(customers, recharges, balance)
 
 
 def main() -> None:
