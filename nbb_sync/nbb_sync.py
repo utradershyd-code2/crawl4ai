@@ -18,6 +18,7 @@ import csv
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -35,23 +36,24 @@ LOGIN_PATH = "/site/login"
 # One request returns every customer (the panel has ~157, so 2000 leaves room).
 CUSTOMERS_URL = PANEL + "/customer/customers?CustomerSearch[perPage]=2000"
 
-# Panel column -> our field name. Columns not listed (Password, CNIC, MAC,
-# Model, Action ...) are deliberately NOT copied.
-COLUMNS = {
-    "Status": "status",
-    "Full Name": "full_name",
-    "Customer ID": "login_name",
-    "Package Name": "package",
-    "Total (Mbps)": "bandwidth_mbps",
-    "Address": "address",
-    "Mobile": "mobile",
-    "Activation Date": "activation_date",
-    "Expiration Date": "expiration_date",
-    "Remaining Days": "remaining_days",
-    "Inactive/Block Reason": "block_reason",
-    "Comments": "comments",
-}
-DATE_FIELDS = ("activation_date", "expiration_date")
+# Panel columns that are copied, under the panel's own headings (ISP Desk's
+# /cron/panel-push recognises these). Columns not listed (Password, CNIC,
+# MAC Address, Model, Action ...) are deliberately NOT copied.
+COLUMNS = [
+    "Status",
+    "Full Name",
+    "Customer ID",
+    "Package Name",
+    "Total (Mbps)",
+    "Address",
+    "Mobile",
+    "Activation Date",
+    "Expiration Date",
+    "Remaining Days",
+    "Inactive/Block Reason",
+    "Comments",
+]
+DEFAULT_SYNC_URL = "https://net.universalfarmaco.com.pk/cron/panel-push"
 
 
 def load_env(path: Path = HERE / ".env") -> None:
@@ -65,19 +67,11 @@ def load_env(path: Path = HERE / ".env") -> None:
             os.environ.setdefault(key.strip(), value.strip())
 
 
-def parse_panel_date(text: str) -> str:
-    """'06-12-2026 11:59:59' (day-month-year) -> '2026-12-06T11:59:59'. Blank stays blank."""
-    text = (text or "").strip()
-    for fmt in ("%d-%m-%Y %H:%M:%S", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(text, fmt).isoformat()
-        except ValueError:
-            pass
-    return text
-
-
 def parse_customers(html: str) -> list[dict]:
-    """Turn the panel's Customer List table into a list of dicts."""
+    """Turn the panel's Customer List table into a list of dicts keyed by panel heading.
+
+    Dates are left exactly as the panel shows them (day-month-year); ISP Desk reads them.
+    """
     soup = BeautifulSoup(html, "lxml")
     table = None
     for t in soup.find_all("table"):
@@ -94,15 +88,8 @@ def parse_customers(html: str) -> list[dict]:
         cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
         if len(cells) < len(headers):  # "No results found." row, etc.
             continue
-        row = {}
-        for head, value in zip(headers, cells):
-            field = COLUMNS.get(head)
-            if field:
-                row[field] = value
-        for f in DATE_FIELDS:
-            if f in row:
-                row[f] = parse_panel_date(row[f])
-        if row.get("login_name"):
+        row = {head: value for head, value in zip(headers, cells) if head in COLUMNS}
+        if row.get("Customer ID"):
             customers.append(row)
     return customers
 
@@ -139,24 +126,33 @@ async def login() -> None:
 
 
 def upload(customers: list[dict]) -> None:
-    url = os.environ.get("SYNC_URL", "").strip()
-    if not url:
-        print("SYNC_URL not set in .env - skipped upload (files saved locally).")
+    """Send the rows to ISP Desk's /cron/panel-push (same key as CRON_KEY on the server)."""
+    key = os.environ.get("CRON_KEY", "").strip()
+    if not key:
+        print("CRON_KEY not set in .env - skipped upload (files saved locally).")
         return
-    body = json.dumps(
-        {"synced_at": datetime.now().isoformat(timespec="seconds"), "customers": customers}
-    ).encode("utf-8")
+    url = os.environ.get("SYNC_URL", "").strip() or DEFAULT_SYNC_URL
+    stamp = datetime.now().strftime("%d-%m-%Y %H:%M")
+    body = json.dumps({"rows": customers, "notes": [f"crawl4ai helper, {stamp}"]}).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
         method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + os.environ.get("SYNC_TOKEN", ""),
-        },
+        headers={"Content-Type": "application/json", "X-Push-Key": key},
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        print(f"Uploaded {len(customers)} customers -> {url} (HTTP {resp.status})")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            res = json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as ex:
+        detail = ex.read().decode("utf-8", "replace")[:300]
+        hint = " (CRON_KEY does not match the server)" if ex.code == 403 else ""
+        print(f"Upload refused: HTTP {ex.code}{hint} {detail}")
+        sys.exit(3)
+    if res.get("error"):
+        print("ISP Desk reported an error:", res["error"])
+        sys.exit(3)
+    print(f"ISP Desk: {res.get('rows', 0)} rows, {res.get('new', 0)} new, "
+          f"{res.get('changed', 0)} changed, {res.get('not_in_panel', 0)} not in panel.")
 
 
 def save(customers: list[dict]) -> None:
@@ -165,7 +161,7 @@ def save(customers: list[dict]) -> None:
         json.dumps(customers, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     with open(OUTPUT_DIR / "customers.csv", "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=list(COLUMNS.values()), extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(customers)
     print(f"Saved {len(customers)} customers to {OUTPUT_DIR}")
@@ -186,9 +182,9 @@ async def sync() -> None:
         sys.exit(1)
 
     customers = parse_customers(result.html)
-    expiring = [c for c in customers if c.get("status") == "Active"
-                and c.get("remaining_days", "").lstrip("-").isdigit()
-                and int(c["remaining_days"]) <= 5]
+    expiring = [c for c in customers if c.get("Status") == "Active"
+                and c.get("Remaining Days", "").lstrip("-").isdigit()
+                and int(c["Remaining Days"]) <= 5]
     print(f"{len(customers)} customers read, {len(expiring)} active ones expire within 5 days.")
     save(customers)
     upload(customers)
