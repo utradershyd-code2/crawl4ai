@@ -13,6 +13,9 @@ The browser profile in ./profile keeps you logged in until the panel ends
 the session; when that happens, `sync` tells you to run `login` again.
 """
 
+import os as _os
+_os.environ.setdefault("CRAWL4AI_NO_CLOUD_NOTICE", "1")  # hide crawl4ai's advert banner
+
 import asyncio
 import csv
 import json
@@ -31,11 +34,20 @@ from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 HERE = Path(__file__).resolve().parent
 PROFILE_DIR = HERE / "profile"
 OUTPUT_DIR = HERE / "output"
+# The panel's login cookie only lasts while a browser window stays open, so login
+# saves the cookies here and every sync puts them back. Keep this file private.
+COOKIES_FILE = PROFILE_DIR / "panel_cookies.json"
 
 PANEL = "https://partner.nationalbroadband.pk"
 LOGIN_PATH = "/site/login"
 # One request returns every customer (the panel has ~157, so 2000 leaves room).
-CUSTOMERS_URL = PANEL + "/customer/customers?CustomerSearch[perPage]=2000"
+CUSTOMERS_URL = PANEL + "/customer/customers?CustomerSearch%5BperPage%5D=2000"
+# Present only on pages you see when logged in ("Available Balance = ...").
+LOGGED_IN_MARK = 'label[for="available_credit_limit"]'
+# The panel shows a short browser check (a script page) before real pages; wait until
+# either a logged-in page or the login form has appeared.
+PAGE_READY = ("js:() => !!document.querySelector('label[for=\"available_credit_limit\"]')"
+              " || !!document.querySelector('input[type=\"password\"]')")
 
 # Panel columns that are copied, under the panel's own headings (ISP Desk's
 # /cron/panel-push recognises these). Columns not listed (Password, CNIC,
@@ -135,6 +147,13 @@ def parse_report(html: str) -> tuple[list[dict], int]:
     return [], total
 
 
+def saved_cookies() -> list[dict]:
+    try:
+        return json.loads(COOKIES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+
+
 def browser(headless: bool) -> AsyncWebCrawler:
     PROFILE_DIR.mkdir(exist_ok=True)
     return AsyncWebCrawler(
@@ -142,28 +161,36 @@ def browser(headless: bool) -> AsyncWebCrawler:
             headless=headless,
             use_persistent_context=True,
             user_data_dir=str(PROFILE_DIR),
+            cookies=saved_cookies(),
             verbose=False,
         )
     )
 
 
 async def login() -> None:
+    """Opens a normal browser window on the panel; you log in yourself. Waits until a
+    logged-in page appears (up to 5 minutes), then keeps the session in ./profile."""
+    from playwright.async_api import async_playwright
+
     print("A browser window will open. Log in to the panel yourself")
     print("(password + security question). You have 5 minutes.")
-    async with browser(headless=False) as crawler:
-        result = await crawler.arun(
-            PANEL + LOGIN_PATH,
-            config=CrawlerRunConfig(
-                cache_mode=CacheMode.BYPASS,
-                wait_for=f"js:() => !location.pathname.startsWith('{LOGIN_PATH}')",
-                page_timeout=300_000,
-            ),
-        )
-    if result.success:
-        print("Logged in. The session is saved; you can now run: python nbb_sync.py sync")
-    else:
-        print("Login was not completed:", result.error_message)
-        sys.exit(1)
+    PROFILE_DIR.mkdir(exist_ok=True)
+    async with async_playwright() as p:
+        ctx = await p.chromium.launch_persistent_context(str(PROFILE_DIR), headless=False, no_viewport=True)
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await page.goto(PANEL + "/site/index", wait_until="domcontentloaded", timeout=120_000)
+        try:
+            await page.wait_for_selector(LOGGED_IN_MARK, timeout=300_000)
+        except Exception:
+            print("Login was not completed within 5 minutes. Run login.bat again.")
+            await ctx.close()
+            sys.exit(1)
+        await page.wait_for_timeout(2000)  # let the panel finish saving its cookies
+        cookies = [c for c in await ctx.cookies() if "nationalbroadband" in c.get("domain", "")
+                   or c.get("domain", "").startswith(("127.0.0.1", "localhost"))]
+        COOKIES_FILE.write_text(json.dumps(cookies), encoding="utf-8")
+        await ctx.close()
+    print("Logged in. The session is saved; syncing now works on its own.")
 
 
 def upload(customers: list[dict], recharges: list[dict] | None = None, balance: str = "") -> None:
@@ -221,32 +248,47 @@ def save(customers: list[dict], recharges: list[dict] | None = None) -> None:
     print(f"Saved {len(customers)} customers to {OUTPUT_DIR}")
 
 
-async def sync() -> None:
-    run = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, page_timeout=60_000)
-    async with browser(headless=True) as crawler:
+async def read_panel(headless: bool):
+    run = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, page_timeout=90_000,
+                           wait_for=PAGE_READY, wait_for_timeout=60_000)
+    async with browser(headless=headless) as crawler:
         result = await crawler.arun(CUSTOMERS_URL, config=run)
+        html = result.html or ""
         final_url = result.redirected_url or result.url or ""
-        if LOGIN_PATH in final_url:
-            print("Panel session expired. Run:  python nbb_sync.py login")
-            sys.exit(2)
-        if not result.success:
-            print("Could not load the panel:", result.error_message)
-            sys.exit(1)
-        customers = parse_customers(result.html)
-        balance = parse_balance(result.html)
+        if LOGIN_PATH in final_url or ('type="password"' in html and "available_credit_limit" not in html):
+            return "logged_out", None
+        if not result.success or "available_credit_limit" not in html:
+            return "failed", result.error_message or "the panel page did not load"
+        customers = parse_customers(html)
+        balance = parse_balance(html)
 
         recharges, seen = [], set()
         for page in range(1, MAX_REPORT_PAGES + 1):
             rep = await crawler.arun(REPORT_URL.format(page=page), config=run)
-            if not rep.success:
+            if not rep.success and "available_credit_limit" not in (rep.html or ""):
                 print(f"Recharge report page {page} could not be read:", rep.error_message)
                 break
-            rows, total = parse_report(rep.html)
+            rows, total = parse_report(rep.html or "")
             new = [r for r in rows if tuple(r.items()) not in seen]
             seen.update(tuple(r.items()) for r in new)
             recharges.extend(new)
             if not new or len(rows) < 10 or (total and len(recharges) >= total):
                 break
+    return "ok", (customers, balance, recharges)
+
+
+async def sync() -> None:
+    status, data = await read_panel(headless=True)
+    if status == "failed":
+        print("Hidden browser was stopped by the panel's check (" + str(data) + "); retrying in a window...")
+        status, data = await read_panel(headless=False)
+    if status == "logged_out":
+        print("Panel session expired. Double-click login.bat (or run: python nbb_sync.py login)")
+        sys.exit(2)
+    if status != "ok":
+        print("Could not load the panel:", data)
+        sys.exit(1)
+    customers, balance, recharges = data
 
     expiring = [c for c in customers if c.get("Status") == "Active"
                 and c.get("Remaining Days", "").lstrip("-").isdigit()
