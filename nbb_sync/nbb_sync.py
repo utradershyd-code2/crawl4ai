@@ -41,13 +41,18 @@ COOKIES_FILE = PROFILE_DIR / "panel_cookies.json"
 PANEL = "https://partner.nationalbroadband.pk"
 LOGIN_PATH = "/site/login"
 # One request returns every customer (the panel has ~157, so 2000 leaves room).
-CUSTOMERS_URL = PANEL + "/customer/customers?CustomerSearch%5BperPage%5D=2000"
+# The panel accepts at most 500 per page (bigger numbers fall back to 25), so pages are
+# also followed in case you ever have more than 500 customers.
+CUSTOMERS_URL = PANEL + "/customer/customers?CustomerSearch%5BperPage%5D=500&page={page}"
 # Present only on pages you see when logged in ("Available Balance = ...").
 LOGGED_IN_MARK = 'label[for="available_credit_limit"]'
 # The panel shows a short browser check (a script page) before real pages; wait until
 # either a logged-in page or the login form has appeared.
 PAGE_READY = ("js:() => !!document.querySelector('label[for=\"available_credit_limit\"]')"
               " || !!document.querySelector('input[type=\"password\"]')")
+# Report pages have no balance line: ready when the report table or summary is there.
+REPORT_READY = ("js:() => !!document.querySelector('table, .summary, .empty')"
+                " || !!document.querySelector('input[type=\"password\"]')")
 
 # Panel columns that are copied, under the panel's own headings (ISP Desk's
 # /cron/panel-push recognises these). Columns not listed (Password, CNIC,
@@ -87,6 +92,13 @@ def load_env(path: Path = HERE / ".env") -> None:
         if line and not line.startswith("#") and "=" in line:
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip())
+
+
+def item_total(html: str) -> int:
+    """'Showing 1-25 of 157 items.' -> 157 (0 if not shown)."""
+    summary = BeautifulSoup(html, "lxml").select_one(".summary")
+    nums = re.findall(r"\d+", summary.get_text().replace(",", "")) if summary else []
+    return int(nums[-1]) if nums else 0
 
 
 def parse_customers(html: str) -> list[dict]:
@@ -251,20 +263,38 @@ def save(customers: list[dict], recharges: list[dict] | None = None) -> None:
 async def read_panel(headless: bool):
     run = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, page_timeout=90_000,
                            wait_for=PAGE_READY, wait_for_timeout=60_000)
+    report_run = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, page_timeout=90_000,
+                                  wait_for=REPORT_READY, wait_for_timeout=30_000)
     async with browser(headless=headless) as crawler:
-        result = await crawler.arun(CUSTOMERS_URL, config=run)
+        result = await crawler.arun(CUSTOMERS_URL.format(page=1), config=run)
         html = result.html or ""
         final_url = result.redirected_url or result.url or ""
         if LOGIN_PATH in final_url or ('type="password"' in html and "available_credit_limit" not in html):
             return "logged_out", None
         if not result.success or "available_credit_limit" not in html:
             return "failed", result.error_message or "the panel page did not load"
-        customers = parse_customers(html)
         balance = parse_balance(html)
+        customers = parse_customers(html)
+        total = item_total(html)
+        page = 1
+        while total and len(customers) < total and page < 40:
+            page += 1
+            more = await crawler.arun(CUSTOMERS_URL.format(page=page), config=run)
+            try:
+                rows = parse_customers(more.html or "")
+            except RuntimeError:
+                rows = []
+            known = {c["Customer ID"] for c in customers}
+            rows = [r for r in rows if r["Customer ID"] not in known]
+            if not rows:
+                break
+            customers.extend(rows)
+        if total and len(customers) < total:
+            return "failed", f"only {len(customers)} of {total} customers could be read; nothing was sent"
 
         recharges, seen = [], set()
         for page in range(1, MAX_REPORT_PAGES + 1):
-            rep = await crawler.arun(REPORT_URL.format(page=page), config=run)
+            rep = await crawler.arun(REPORT_URL.format(page=page), config=report_run)
             if not rep.success and "available_credit_limit" not in (rep.html or ""):
                 print(f"Recharge report page {page} could not be read:", rep.error_message)
                 break
