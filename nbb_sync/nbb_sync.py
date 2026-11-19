@@ -202,6 +202,7 @@ async def login() -> None:
                    or c.get("domain", "").startswith(("127.0.0.1", "localhost"))]
         COOKIES_FILE.write_text(json.dumps(cookies), encoding="utf-8")
         await ctx.close()
+    ALERT_FLAG.unlink(missing_ok=True)
     print("Logged in. The session is saved; syncing now works on its own.")
 
 
@@ -241,6 +242,49 @@ def upload(customers: list[dict], recharges: list[dict] | None = None, balance: 
           f"{res.get('payments_new', 0)} recharge invoices created.")
     for note in res.get("notes") or []:
         print("  -", note)
+
+
+ALERT_FLAG = OUTPUT_DIR / ".panel_alert_shown"
+
+
+def report_problem(message: str) -> None:
+    """Tell ISP Desk the helper cannot read the panel, so the dashboard shows it instead of
+    silently keeping old data. Uses the same key as uploads; a failure here is ignored."""
+    key = os.environ.get("CRON_KEY", "").strip()
+    if not key:
+        return
+    url = (os.environ.get("SYNC_URL", "").strip() or DEFAULT_SYNC_URL).replace("/panel-push", "/panel-balance")
+    req = urllib.request.Request(url, data=json.dumps({"error": message}).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json", "X-Push-Key": key})
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception as ex:
+        print("Could not tell ISP Desk about the problem:", ex)
+
+
+def notify_pc(message: str) -> None:
+    """Show a Windows notification once per problem (not every 15 minutes)."""
+    if os.name != "nt" or ALERT_FLAG.exists():
+        return
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    ALERT_FLAG.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+    text = message.replace("'", "''")
+    ps = ("Add-Type -AssemblyName System.Windows.Forms; $n=New-Object System.Windows.Forms.NotifyIcon; "
+          "$n.Icon=[System.Drawing.SystemIcons]::Warning; $n.Visible=$true; "
+          f"$n.ShowBalloonTip(60000,'ISP Desk panel sync','{text}','Warning'); Start-Sleep -Seconds 60; $n.Dispose()")
+    import subprocess
+    try:
+        subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError:
+        pass
+
+
+def problem(message: str, code: int) -> None:
+    print(message)
+    report_problem(message)
+    notify_pc(message)
+    sys.exit(code)
 
 
 def save(customers: list[dict], recharges: list[dict] | None = None) -> None:
@@ -313,12 +357,12 @@ async def sync() -> None:
         print("Hidden browser was stopped by the panel's check (" + str(data) + "); retrying in a window...")
         status, data = await read_panel(headless=False)
     if status == "logged_out":
-        print("Panel session expired. Double-click login.bat (or run: python nbb_sync.py login)")
-        sys.exit(2)
+        problem("The National Broadband panel signed this PC out. Double-click login.bat in the "
+                "isp-desk-helper folder and sign in to the panel again.", 2)
     if status != "ok":
-        print("Could not load the panel:", data)
-        sys.exit(1)
+        problem("Could not load the National Broadband panel: " + str(data), 1)
     customers, balance, recharges = data
+    ALERT_FLAG.unlink(missing_ok=True)  # working again: the next problem gets a fresh notification
 
     expiring = [c for c in customers if c.get("Status") == "Active"
                 and c.get("Remaining Days", "").lstrip("-").isdigit()

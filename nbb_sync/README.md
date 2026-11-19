@@ -30,12 +30,27 @@ Or double-click `run_sync.bat` (output goes to `sync_log.txt`). Results land in 
 
 It prints what ISP Desk did, e.g. `ISP Desk: 157 rows, 0 new, 3 changed`.
 
-* **"Panel session expired"**: run `python nbb_sync.py login` again.
+* **"The National Broadband panel signed this PC out"**: double-click `login.bat` and sign in.
 * **"Upload refused: HTTP 403"**: `CRON_KEY` in `.env` doesn't match the server.
 
 ## Run it automatically
-`setup.bat` creates the Task Scheduler task **"NBB Panel Sync"** (every 15 minutes while
-the PC is on, which also keeps the panel login alive). Results are written to `sync_log.txt`. Session expired? Double-click `login.bat`.
+`setup.bat` creates the Task Scheduler task **"NBB Panel Sync"**. Double-click `schedule.bat`
+to create or repair the task on its own. The task:
+- runs every 15 minutes, which also keeps the panel login alive;
+- wakes the PC from sleep for each run, and runs a missed sync as soon as the PC is back;
+- never starts a second copy while one is still running.
+
+Results are written to `sync_log.txt`.
+
+**If the panel signs the PC out**, the panel ends the session, for example after the PC has slept
+for a long time. When that happens:
+- ISP Desk shows a red alert on the dashboard, and "Panel login expired" under the panel balance;
+- this PC shows a Windows notification once.
+
+Double-click `login.bat`, sign in, and syncing continues.
+
+Tip: in Windows Settings > System > Power, set "When plugged in, put my device to sleep" to
+**Never** on the PC that runs this. A locked screen is fine; sleep is what stops the sync.
 
 ## Privacy
 `profile/` (your logged-in session), `output/` (customer data) and `.env` are in

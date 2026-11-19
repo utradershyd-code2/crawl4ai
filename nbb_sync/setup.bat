@@ -38,7 +38,7 @@ echo First sync:
 "%PY%" nbb_sync.py sync
 echo.
 echo Scheduling an automatic sync every 15 minutes while this PC is on...
-schtasks /Create /SC MINUTE /MO 15 /TN "NBB Panel Sync" /TR "\"%~dp0run_sync.bat\"" /F >nul && echo Done: Task Scheduler runs it every 15 minutes, which also keeps the panel login alive.
+call "%~dp0schedule.bat" quiet
 echo.
 echo Setup finished. If you ever see "Panel session expired", double-click login.bat.
 pause
